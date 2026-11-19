@@ -2,8 +2,6 @@
 
 A PyTorch physics-informed neural network for steady, three-dimensional aerodynamic flow. The model learns velocity and pressure from OpenFOAM CSV exports at different reference velocities, then incorporates incompressible Navier–Stokes residuals during training.
 
-The repository root is `ML`. Run the commands below from that directory.
-
 ## Setup
 Training automatically uses CUDA when available and otherwise uses the CPU. Apple Metal/MPS is not selected by the current entry point. Current model uses user-edited OpenFoam files to properly train (deleting a few columns for concision).
 
