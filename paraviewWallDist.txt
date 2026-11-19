@@ -1,0 +1,120 @@
+import vtk
+import re
+import os
+import numpy as np
+from vtk.numpy_interface import dataset_adapter as dsa
+from vtk.util.numpy_support import numpy_to_vtk
+from scipy.spatial import cKDTree
+
+EXCLUDE_NAMES = {"internalMesh", "face1", "face2", "face3", "face4", "face5", "face6"}
+
+CHECK_NO_SLIP = True
+CASE_DIR = "/path/to/your/case"
+TIME_DIR = "0"
+
+input0 = self.GetInputDataObject(0, 0)
+output = self.GetOutputDataObject(0)
+output.ShallowCopy(input0)
+
+def base_name(name):
+    return None if name is None else name.split('/')[-1]
+
+def is_composite(blk):
+    return blk.IsA("vtkMultiBlockDataSet") or blk.IsA("vtkMultiPieceDataSet") \
+        or blk.IsA("vtkPartitionedDataSetCollection") or blk.IsA("vtkPartitionedDataSet")
+
+wall_append = vtk.vtkAppendPolyData()
+wall_patch_names = []
+all_leaf_names = []
+state = {"internal_mesh_path": None}
+
+def recurse(mb, path):
+    for i in range(mb.GetNumberOfBlocks()):
+        md = mb.GetMetaData(i)
+        name = md.Get(vtk.vtkCompositeDataSet.NAME()) if md else None
+        blk = mb.GetBlock(i)
+        if blk is None:
+            continue
+        if is_composite(blk):
+            recurse(blk, path + [i])
+            continue
+        all_leaf_names.append(name)
+        bname = base_name(name)
+        if bname == "internalMesh":
+            state["internal_mesh_path"] = path + [i]
+        elif bname not in EXCLUDE_NAMES:
+            geom = vtk.vtkGeometryFilter()
+            geom.SetInputData(blk)
+            geom.Update()
+            wall_append.AddInputData(geom.GetOutput())
+            wall_patch_names.append(bname)
+
+recurse(input0, [])
+internal_mesh_path = state["internal_mesh_path"]
+
+if internal_mesh_path is None:
+    raise RuntimeError("Could not find 'internalMesh'. Available leaf blocks: %s" % all_leaf_names)
+if not wall_patch_names:
+    raise RuntimeError("No boundary patches left after excluding %s. Available: %s" %
+                        (EXCLUDE_NAMES, all_leaf_names))
+
+wall_append.Update()
+wall_poly = wall_append.GetOutput()
+
+def get_nested_block(mb, path):
+    blk = mb
+    for idx in path:
+        blk = blk.GetBlock(idx)
+    return blk
+
+internal_mesh = get_nested_block(input0, internal_mesh_path)
+
+wall_wrapped = dsa.WrapDataObject(wall_poly)
+wall_pts = np.asarray(wall_wrapped.Points)
+
+mesh_wrapped = dsa.WrapDataObject(internal_mesh)
+mesh_pts = np.asarray(mesh_wrapped.Points)
+
+tree = cKDTree(wall_pts)
+dist, _ = tree.query(mesh_pts, k=1)
+
+vtk_arr = numpy_to_vtk(dist.astype(np.float64), deep=True)
+vtk_arr.SetName("wallDist")
+
+out_internal = get_nested_block(output, internal_mesh_path)
+out_internal.GetPointData().AddArray(vtk_arr)
+
+print("wallDist computed using %d boundary points from patches: %s" %
+      (wall_poly.GetNumberOfPoints(), wall_patch_names))
+
+if CHECK_NO_SLIP:
+    u_file = os.path.join(CASE_DIR, TIME_DIR, "U")
+    if not os.path.isfile(u_file):
+        print("WARNING: could not find U file at %s -- skipping no-slip check." % u_file)
+    else:
+        with open(u_file, "r") as f:
+            text = f.read()
+        text_nc = re.sub(r"//.*", "", text)
+        text_nc = re.sub(r"/\*.*?\*/", "", text_nc, flags=re.S)
+
+        NO_SLIP_TYPES = {"noSlip", "movingWallVelocity"}
+        print("\n--- U boundary condition check for included patches ---")
+        mismatches = []
+        for pname in wall_patch_names:
+            m = re.search(r"\b" + re.escape(pname) + r"\s*\{([^{}]*)\}", text_nc)
+            if not m:
+                print(f"  {pname:20s} -> NOT FOUND in U file")
+                mismatches.append(pname)
+                continue
+            tm = re.search(r"\btype\s+(\S+?)\s*;", m.group(1))
+            bc_type = tm.group(1) if tm else "unknown"
+            flag = "" if bc_type in NO_SLIP_TYPES else "  <-- NOT no-slip!"
+            print(f"  {pname:20s} -> {bc_type}{flag}")
+            if bc_type not in NO_SLIP_TYPES:
+                mismatches.append(pname)
+
+        if mismatches:
+            print("\nWARNING: these included patches do NOT have a no-slip U BC: %s" % mismatches)
+            print("Double-check whether they should really be excluded (like face1-6).")
+        else:
+            print("\nAll included patches confirmed no-slip.")

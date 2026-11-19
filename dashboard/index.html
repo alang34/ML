@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PINN Live Dashboard</title>
+<style>
+:root{color-scheme:dark;--bg:#0f172a;--panel:#1e293b;--panel2:#111827;--border:#334155;--text:#f8fafc;--muted:#94a3b8;--accent:#2563eb;--good:#22c55e;--warn:#f59e0b;--bad:#ef4444}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--text)}
+#root{width:min(2200px,100%);margin:auto;padding:22px}header{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px}
+h1,h2,h3,p{margin:0}h1{font-size:1.75rem}h2{font-size:1.02rem}h3{font-size:.9rem}#subtitle,.muted{color:var(--muted)}#subtitle{margin-top:4px}
+.badge{padding:8px 14px;border-radius:999px;background:var(--accent);color:#fff;font-weight:700;white-space:nowrap}
+.metrics{display:grid;grid-template-columns:repeat(6,minmax(145px,1fr));gap:10px;margin-bottom:12px}.metric,.panel,.plot-panel,.alerts{background:var(--panel);border:1px solid var(--border);border-radius:12px}
+.metric{padding:13px}.metric .label{color:var(--muted);font-size:.78rem}.metric .value{font-size:1.25rem;font-weight:750;margin-top:4px}.metric .detail{color:var(--muted);font-size:.72rem;margin-top:3px}
+.section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:18px 0 9px}.grid-two{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.panel{padding:13px;overflow:auto}.panel-title-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}th,td{padding:7px 8px;border-bottom:1px solid var(--border);text-align:right;font-size:.83rem}th:first-child,td:first-child{text-align:left}th{color:var(--muted);font-weight:650}
+.plot-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.plot-panel{padding:12px;min-width:0}.plot-panel h3{margin-bottom:8px;color:#e2e8f0}.plot-panel img{display:block;width:100%;height:auto;background:#fff;border-radius:8px}.plot-panel.missing img{display:none}.plot-placeholder{display:none;min-height:180px;align-items:center;justify-content:center;text-align:center;color:var(--muted);border:1px dashed var(--border);border-radius:8px;padding:20px}.plot-panel.missing .plot-placeholder{display:flex}.monitor-full{grid-column:1/-1}
+.log-entry{display:grid;grid-template-columns:110px 190px 1fr;gap:12px;padding:7px 0;border-bottom:1px solid var(--border);font-size:.81rem}
+.alerts{padding:13px;margin-bottom:12px}.alert-entry{display:grid;grid-template-columns:86px 185px 1fr;gap:10px;padding:9px 10px;margin-top:7px;border-radius:8px;border-left:5px solid #64748b;background:var(--panel2)}
+.alert-entry.warning{border-left-color:var(--warn)}.alert-entry.error{border-left-color:var(--bad)}.alert-entry.info{border-left-color:#3b82f6}.alert-entry.success{border-left-color:var(--good)}
+.alert-severity{text-transform:uppercase;font-weight:750;font-size:.72rem}.alert-time,.alert-epoch{color:var(--muted);font-size:.77rem}
+button{border:1px solid #475569;background:var(--panel2);color:var(--text);border-radius:7px;padding:5px 9px;cursor:pointer}
+.kv-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px 14px}.kv{border-bottom:1px solid var(--border);padding:6px 0}.kv .k{font-size:.74rem;color:var(--muted)}.kv .v{font-size:.86rem;margin-top:2px;word-break:break-word}
+footer{color:var(--muted);font-size:.74rem;text-align:right;padding:14px 2px 0}
+@media(max-width:1400px){.metrics{grid-template-columns:repeat(3,1fr)}.kv-grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:1000px){.grid-two,.plot-grid{grid-template-columns:1fr}.monitor-full{grid-column:auto}.kv-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:650px){#root{padding:12px}header{flex-direction:column}.metrics{grid-template-columns:repeat(2,1fr)}.kv-grid{grid-template-columns:1fr}.log-entry,.alert-entry{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div id="root">
+<header><div><h1>3D OpenFOAM RANS PINN</h1><p id="subtitle">Waiting for training data...</p></div><div id="statusBadge" class="badge">Starting</div></header>
+
+<section id="alertPanel" class="alerts" hidden>
+<div class="panel-title-row"><h2>Runtime alerts</h2><button id="clearAlerts" type="button">Clear locally</button></div><div id="alertList"></div>
+</section>
+
+<section class="metrics" id="metricCards"></section>
+
+<div class="section-title"><h2>Optimization and validation</h2></div>
+<section class="grid-two">
+<article class="panel"><h2>Losses and PDE influence</h2><div id="lossTable"></div></article>
+<article class="panel"><h2>Validation relative L2 error</h2><div id="validationTable"></div></article>
+</section>
+<section class="grid-two">
+<article class="panel"><h2>Prediction distribution: predicted / true</h2><div id="distributionTable"></div></article>
+<article class="panel"><h2>PDE residual diagnostics</h2><div id="residualTable"></div></article>
+</section>
+<section class="grid-two">
+<article class="panel"><h2>PDE stability</h2><div id="pdeStability"></div></article>
+<article class="panel"><h2>Validation regions / Uref</h2><div id="validationExtra"></div></article>
+</section>
+
+<div class="section-title"><h2>Run configuration</h2></div>
+<section class="panel"><div id="configGrid" class="kv-grid"></div></section>
+
+<div class="section-title"><h2>Plots</h2><span id="updatedAt" class="muted"></span></div>
+<article class="plot-panel monitor-full" data-image="training_monitor.png"><h3>Combined training monitor</h3><img alt="Combined training monitor"><div class="plot-placeholder">Waiting for training_monitor.png</div></article>
+</section>
+
+<div class="section-title"><h2>Logs</h2></div>
+<section class="grid-two">
+<article class="panel"><div class="panel-title-row"><h2>Checkpoint save log</h2><span id="lastSave" class="muted"></span></div><div id="saveLog"></div></article>
+<article class="panel"><h2>Event / collocation log</h2><div id="eventLog"></div></article>
+</section>
+<footer id="footerStatus">Waiting for status.json</footer>
+</div>
+
+<script>
+const POLL_MS=1000;
+const fmt=(x,d=3)=>(x==null||!Number.isFinite(Number(x)))?'--':Number(x).toExponential(d);
+const pct=x=>(x==null||!Number.isFinite(Number(x)))?'--':(100*Number(x)).toFixed(1)+'%';
+const ratioPct=x=>(x==null||!Number.isFinite(Number(x)))?'--':(Math.abs(100*Number(x))<.01?(100*Number(x)).toExponential(2):(100*Number(x)).toFixed(2))+'%';
+const fixed=(x,d=2)=>(x==null||!Number.isFinite(Number(x)))?'--':Number(x).toFixed(d);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const table=(h,r)=>`<table><thead><tr>${h.map(x=>`<th>${esc(x)}</th>`).join('')}</tr></thead><tbody>${r.map(row=>`<tr>${row.map(v=>`<td>${v}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+
+function fieldsFrom(d){
+  if(Array.isArray(d.fields)&&d.fields.length)return d.fields;
+  for(const s of [d.validation,d.field_losses,d.statistics]){
+    if(s&&typeof s==='object'){const k=Object.keys(s).filter(x=>!x.startsWith('_')&&!['wake_error','freestream_error','overall_error'].includes(x));if(k.length)return k}
+  }
+  return ['u','v','w','p','nut'];
+}
+function renderCards(d){
+ const L=d.losses||{},P=d.pde||{},T=d.time||{};
+ const cards=[
+ ['Epoch',Number(d.epoch||0).toLocaleString(),fixed(d.progress_percent,1)+'% complete'],
+ ['Learning rate',fmt(d.learning_rate,2),d.phase||'--'],
+ ['Total loss',fmt(L.total),'Data '+fmt(L.data)],
+ ['Weighted PDE',fmt(L.weighted_pde),'Raw '+fmt(L.pde_raw)],
+ ['Effective lambda',fmt(P.effective_lambda,2),'Actual ratio '+ratioPct(P.actual_grad_ratio)],
+ ['ETA',fixed(T.eta_minutes,1)+' min','Elapsed '+fixed(T.elapsed_minutes,1)+' min']];
+ document.getElementById('metricCards').innerHTML=cards.map(c=>`<div class="metric"><div class="label">${esc(c[0])}</div><div class="value">${c[1]}</div><div class="detail">${esc(c[2])}</div></div>`).join('');
+}
+function renderTables(d){
+ const L=d.losses||{},P=d.pde||{},C=d.comparisons||{};
+ document.getElementById('lossTable').innerHTML=table(['Quantity','Value','Comparison'],[
+ ['Total loss',fmt(L.total),'Optimizer objective'],['Data loss',fmt(L.data),'Supervised CFD objective'],
+ ['Raw PDE loss',fmt(L.pde_raw),'Before lambda'],['Weighted PDE loss',fmt(L.weighted_pde),ratioPct(C.weighted_pde_to_data)+' of data loss'],
+ ['Effective lambda',fmt(P.effective_lambda),'PDE loss multiplier'],['EMA cosine',fixed(P.gradient_cosine,3),'Gate '+ratioPct(P.cosine_gate)],
+ ['Scheduled ratio cap',ratioPct(P.scheduled_ratio_cap),'Maximum currently allowed'],['Desired ratio',ratioPct(P.desired_grad_ratio),'Cap x cosine gate'],
+ ['Target weighted ratio',ratioPct(P.target_grad_ratio),'EMA-smoothed desired ratio'],['Actual weighted ratio',ratioPct(P.actual_grad_ratio),'Applied PDE/data gradient ratio'],
+ ['Data gradient norm',fmt(P.data_grad_norm),''],['Raw PDE gradient norm',fmt(P.pde_grad_norm),fixed(C.pde_to_data_grad_ratio,2)+'x data gradient'],
+ ['Weighted PDE gradient norm',fmt(P.weighted_pde_grad_norm),ratioPct(C.actual_weighted_grad_ratio)+' of data gradient'],
+ ['Anchor / retention','Not enabled','No anchor term in objective']]);
+ const fields=fieldsFrom(d);
+ const statsRoot=d.statistics||d.validation_stats||d.stats||{};
+ const residualRoot=d.residuals||d.pde_residuals||d.residual_diagnostics||{};
+ document.getElementById('validationTable').innerHTML=table(['Field','Relative L2','Component loss'],fields.map(n=>[esc(n),pct(d.validation?.[n]),fmt(d.field_losses?.[n])]));
+ document.getElementById('distributionTable').innerHTML=table(['Field','Mean pred / true','Std pred / true','Std ratio'],fields.map(n=>{const s=statsRoot?.[n]||{};return[esc(n),`${fmt(s.pred_mean,2)} / ${fmt(s.true_mean,2)}`,`${fmt(s.pred_std,2)} / ${fmt(s.true_std,2)}`,fixed(s.std_ratio,3)]}));
+ const r=residualRoot||{},c=r.component||r.components||{},rms=r.rms||{},mx=r.max||r.maximum||{};
+ document.getElementById('residualTable').innerHTML=table(['Equation','Component','RMS','Max |r|'],[
+ ['x-momentum',fmt(c.rx),fmt(rms.rx),fmt(mx.rx)],['y-momentum',fmt(c.ry),fmt(rms.ry),fmt(mx.ry)],
+ ['z-momentum',fmt(c.rz),fmt(rms.rz),fmt(mx.rz)],['continuity',fmt(c.rc),fmt(rms.rc),fmt(mx.rc)]]);
+}
+function renderOptional(d){
+ const s=d.pde_stability||d.stability||d.pde_stats||d.pde_statistics||{};
+ document.getElementById('pdeStability').innerHTML=table(['Metric','Value'],[['Mean',fmt(s.mean)],['Std',fmt(s.std)],['COV',fmt(s.cov)],['Slope',fmt(s.slope)],['Window',esc(s.window??'--')]]);
+ const rows=[],extra=d.validation_extra||d.validation_regions||{},uref=d.validation_by_uref||d.uref_validation||{};
+ for(const [k,v] of Object.entries(extra))rows.push([esc(k),typeof v==='number'?pct(v):esc(JSON.stringify(v))]);
+ for(const [k,v] of Object.entries(uref)){if(v&&typeof v==='object'){for(const [f,x] of Object.entries(v))rows.push([`${esc(k)} / ${esc(f)}`,pct(x)])}else rows.push([esc(k),pct(v)])}
+ for(const k of ['wake_error','freestream_error','overall_error'])if(d.validation?.[k]!=null)rows.push([esc(k),pct(d.validation[k])]);
+ document.getElementById('validationExtra').innerHTML=rows.length?table(['Metric','Value'],rows):'<div class="muted">No regional or Uref validation metrics published yet.</div>';
+ const cfg={...(d.configuration||{}),...(d.config||{})};
+ if(d.collocation)for(const [k,v] of Object.entries(d.collocation))cfg['collocation.'+k]=v;
+ for(const [k,v] of Object.entries({status_update_every:d.status_update_every,image_update_every:d.image_update_every,total_epochs:d.total_epochs,phase:d.phase}))if(v!=null&&cfg[k]==null)cfg[k]=v;
+ document.getElementById('configGrid').innerHTML=Object.keys(cfg).length?Object.entries(cfg).map(([k,v])=>`<div class="kv"><div class="k">${esc(k)}</div><div class="v">${esc(typeof v==='object'?JSON.stringify(v):v)}</div></div>`).join(''):'<div class="muted">No configuration dictionary published yet.</div>';
+}
+function renderLogs(d){
+ const last=d.last_checkpoint||{};
+ document.getElementById('lastSave').textContent=last.epoch==null?(last.status||'No checkpoint saved yet'):`Last saved epoch ${Number(last.epoch).toLocaleString()} at ${last.time||'--'}`;
+ const log=d.save_log||[];
+ document.getElementById('saveLog').innerHTML=log.length?log.slice().reverse().map(e=>`<div class="log-entry"><span>Epoch ${Number(e.epoch||0).toLocaleString()}</span><span>${esc(e.time||'')}</span><span>${esc(e.message||'')}</span></div>`).join(''):'<div class="muted">No checkpoint entries yet.</div>';
+ const events=d.event_log||d.collocation_log||d.events||[];
+ document.getElementById('eventLog').innerHTML=events.length?events.slice().reverse().map(e=>typeof e==='string'?`<div class="log-entry"><span></span><span></span><span>${esc(e)}</span></div>`:`<div class="log-entry"><span>${e.epoch==null?'':`Epoch ${Number(e.epoch).toLocaleString()}`}</span><span>${esc(e.time||'')}</span><span>${esc(e.message||e.event||'')}</span></div>`).join(''):'<div class="muted">No event/collocation log published yet.</div>';
+}
+function refreshImages(force=false){
+ const stamp=Date.now();
+ document.querySelectorAll('.plot-panel[data-image]').forEach(panel=>{
+  const img=panel.querySelector('img'); if(!force&&img.dataset.loaded)return;
+  img.onerror=()=>{panel.classList.add('missing');img.dataset.loaded=''};
+  img.onload=()=>{panel.classList.remove('missing');img.dataset.loaded='1'};
+  img.src=`${panel.dataset.image}?t=${stamp}`;
+ });
+}
+function render(d){
+ const e=Number(d.epoch||0),t=Number(d.total_epochs||0);
+ document.getElementById('subtitle').textContent=`Epoch ${e.toLocaleString()} / ${t.toLocaleString()} - ${d.phase||'--'} - metrics every ${d.status_update_every??'--'} epoch; plots every ${d.image_update_every??'--'}`;
+ document.getElementById('statusBadge').textContent=d.status||'Training';
+ renderCards(d);renderTables(d);renderOptional(d);renderLogs(d);
+ document.getElementById('updatedAt').textContent=`Metrics ${d.updated_at||'--'} | Plot epoch ${d.plot_epoch??'--'}`;
+ document.getElementById('footerStatus').textContent=`Last status update: ${d.updated_at||'--'} | Browser refresh: ${POLL_MS} ms`;
+ if(d.plot_updated)refreshImages(true);
+}
+function renderAlerts(p){
+ const a=(p&&p.alerts)||[],panel=document.getElementById('alertPanel');panel.hidden=a.length===0;
+ document.getElementById('alertList').innerHTML=a.slice().reverse().map(x=>`<div class="alert-entry ${esc(x.severity||'info')}"><span class="alert-severity">${esc(x.severity||'info')}</span><span><span class="alert-time">${esc(x.time||'')}</span>${x.epoch==null?'':`<br><span class="alert-epoch">Epoch ${Number(x.epoch).toLocaleString()}</span>`}</span><span>${esc(x.message||'')}</span></div>`).join('');
+}
+async function refresh(){
+ try{const r=await fetch('status.json?t='+Date.now(),{cache:'no-store'});if(!r.ok)throw Error(r.status);render(await r.json())}
+ catch(e){document.getElementById('statusBadge').textContent='Waiting for update';document.getElementById('footerStatus').textContent='status.json unavailable: '+e}
+ try{const a=await fetch('alerts.json?t='+Date.now(),{cache:'no-store'});if(a.ok)renderAlerts(await a.json())}catch(e){}
+}
+document.getElementById('clearAlerts').addEventListener('click',()=>{document.getElementById('alertPanel').hidden=true;document.getElementById('alertList').innerHTML=''});
+refreshImages(true);refresh();setInterval(refresh,POLL_MS);
+</script>
+</body>
+</html>
