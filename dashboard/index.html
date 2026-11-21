@@ -41,6 +41,7 @@ footer{color:var(--muted);font-size:.74rem;text-align:right;padding:14px 2px 0}
 <article class="panel"><h2>Losses and PDE influence</h2><div id="lossTable"></div></article>
 <article class="panel"><h2>Validation relative L2 error</h2><div id="validationTable"></div></article>
 </section>
+<section class="panel"><h2>What drives the total loss</h2><div id="objectiveTable"></div><p id="objectiveGradientNote" class="muted"></p></section>
 <section class="grid-two">
 <article class="panel"><h2>Prediction distribution: predicted / true</h2><div id="distributionTable"></div></article>
 <article class="panel"><h2>PDE residual diagnostics</h2><div id="residualTable"></div></article>
@@ -88,12 +89,26 @@ function renderCards(d){
  ['Learning rate',fmt(d.learning_rate,2),d.phase||'--'],
  ['Total loss',fmt(L.total),'Data '+fmt(L.data)],
  ['Weighted PDE',fmt(L.weighted_pde),'Raw '+fmt(L.pde_raw)],
+ ['Weighted boundary',fmt(L.weighted_boundary),'Raw '+fmt(L.boundary_raw)],
  ['Effective lambda',fmt(P.effective_lambda,2),'Actual ratio '+ratioPct(P.actual_grad_ratio)],
  ['ETA',fixed(T.eta_minutes,1)+' min','Elapsed '+fixed(T.elapsed_minutes,1)+' min']];
  document.getElementById('metricCards').innerHTML=cards.map(c=>`<div class="metric"><div class="label">${esc(c[0])}</div><div class="value">${c[1]}</div><div class="detail">${esc(c[2])}</div></div>`).join('');
 }
 function renderTables(d){
  const L=d.losses||{},P=d.pde||{},C=d.comparisons||{};
+ const objective=d.objective||{},terms=objective.weighted_terms||{},g=objective.gradients;
+ const lossTotal=L.total>0?L.total:null;
+ const names=[['data','CFD velocity and pressure'],['boundary','Boundary'],['vorticity','Wake vorticity'],
+              ['momentum','Momentum'],['mass','Mass continuity (by construction)']];
+ const totalNorm=Object.values(g?.norms||{}).reduce((sum,n)=>sum+(Number(n)||0),0);
+ document.getElementById('objectiveTable').innerHTML=table(['Term','Weighted loss','Share of total','Gradient norm','Share of norms'],
+  names.map(([key,label])=>{
+   const norm=g?(g.norms[key]??0):null;
+   return [esc(label),fmt(terms[key]),lossTotal&&terms[key]!=null?pct(terms[key]/lossTotal):'--',fmt(norm),totalNorm>0?pct(norm/totalNorm):'--'];
+  }));
+ document.getElementById('objectiveGradientNote').textContent=g
+  ? `Weighted parameter gradients at epoch ${g.epoch}. Shares compare magnitudes before Adam; gradients can reinforce or cancel.`
+  : 'Waiting for a gradient measurement.';
  document.getElementById('lossTable').innerHTML=table(['Quantity','Value','Comparison'],[
  ['Total loss',fmt(L.total),'Optimizer objective'],['Data loss',fmt(L.data),'Supervised CFD objective'],
  ['Raw PDE loss',fmt(L.pde_raw),'Before lambda'],['Weighted PDE loss',fmt(L.weighted_pde),ratioPct(C.weighted_pde_to_data)+' of data loss'],
@@ -106,7 +121,9 @@ function renderTables(d){
  const fields=fieldsFrom(d);
  const statsRoot=d.statistics||d.validation_stats||d.stats||{};
  const residualRoot=d.residuals||d.pde_residuals||d.residual_diagnostics||{};
- document.getElementById('validationTable').innerHTML=table(['Field','Relative L2','Component loss'],fields.map(n=>[esc(n),pct(d.validation?.[n]),fmt(d.field_losses?.[n])]));
+ const validationRows=fields.map(n=>[esc(n),pct(d.validation?.[n]),fmt(d.field_losses?.[n])]);
+ if(d.vorticity_validation)validationRows.push(['Wake ωₓ',pct(d.vorticity_validation.relative_l2),'--']);
+ document.getElementById('validationTable').innerHTML=table(['Field','Relative L2','Component loss'],validationRows);
  document.getElementById('distributionTable').innerHTML=table(['Field','Mean pred / true','Std pred / true','Std ratio'],fields.map(n=>{const s=statsRoot?.[n]||{};return[esc(n),`${fmt(s.pred_mean,2)} / ${fmt(s.true_mean,2)}`,`${fmt(s.pred_std,2)} / ${fmt(s.true_std,2)}`,fixed(s.std_ratio,3)]}));
  const r=residualRoot||{},c=r.component||r.components||{},rms=r.rms||{},mx=r.max||r.maximum||{};
  document.getElementById('residualTable').innerHTML=table(['Equation','Component','RMS','Max |r|'],[

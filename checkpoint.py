@@ -21,7 +21,11 @@ class CheckpointManager:
         return {
             "epoch": epoch,
             "model_state_dict": trainer.model.state_dict(),
-            "model_features": {"spatial_frequencies": trainer.model.spatial_frequencies},
+            "model_features": {
+                "spatial_frequencies": trainer.model.spatial_frequencies,
+                "velocity_representation": trainer.model.velocity_representation,
+                "coordinate_lengths": trainer.model.coordinate_lengths,
+            },
             "optimizer_state_dict": trainer.optimizer.state_dict(),
             "scheduler_state_dict": trainer.scheduler.state_dict() if trainer.scheduler is not None else None,
 
@@ -109,43 +113,35 @@ class CheckpointManager:
         history[:rows, :cols] = old_history[:rows, :cols]
         trainer.diagnostics._log_idx = min(diag["_log_idx"], history.shape[0])
 
-        old_validation = diag["validationHistory"]
+        old_validation = diag["validationHistory"][:diag["_val_idx"]]
         validation = trainer.diagnostics.validationHistory
-        rows, cols = min(old_validation.shape[0], validation.shape[0]), min(old_validation.shape[1], validation.shape[1])
+        rows = old_validation.shape[0]
+        interval = trainer.config.VALIDATION_EVERY
+        remaining = max(0, (trainer.config.EPOCHS - 1) // interval - state["epoch"] // interval)
+        if rows + remaining > len(validation):
+            validation = validation.new_zeros((rows + remaining, validation.shape[1]))
+            trainer.diagnostics.validationHistory = validation
+        cols = min(old_validation.shape[1], validation.shape[1])
         validation[:rows, :cols] = old_validation[:rows, :cols]
-        trainer.diagnostics._val_idx = min(diag["_val_idx"], validation.shape[0])
+        trainer.diagnostics._val_idx = rows
 
         trainer.epoch = state["epoch"]+1
+        trainer.update_learning_rate()
         trainer.phase = state["phase"]
 
     @staticmethod
     def _prepare_spatial_features(trainer, state):
         saved_features = state.get("model_features")
-        if saved_features is not None:
-            if tuple(saved_features["spatial_frequencies"]) != trainer.model.spatial_frequencies:
-                raise ValueError("Checkpoint spatial frequencies differ from config; restore the checkpoint's frequency setting before resuming.")
-            return
-
-        old_weight = state["model_state_dict"]["input_layer.weight"]
-        new_weight = trainer.model.input_layer.weight
-        if old_weight.shape == new_weight.shape:
-            return
-        if (old_weight.shape[0] != new_weight.shape[0]
-                or old_weight.shape[1] != trainer.model.input_min.numel()
-                or old_weight.shape[1] >= new_weight.shape[1]):
-            raise ValueError("Checkpoint input layer is incompatible with the configured model.")
-
-        padding = new_weight.shape[1] - old_weight.shape[1]
-        state["model_state_dict"]["input_layer.weight"] = torch.nn.functional.pad(old_weight, (0, padding))
-        optimizer = state["optimizer_state_dict"]
-        for saved_group, current_group in zip(optimizer["param_groups"], trainer.optimizer.param_groups):
-            for saved_id, parameter in zip(saved_group["params"], current_group["params"]):
-                if parameter is new_weight:
-                    moments = optimizer["state"].get(saved_id, {})
-                    for name, value in list(moments.items()):
-                        if isinstance(value, torch.Tensor) and value.shape == old_weight.shape:
-                            moments[name] = torch.nn.functional.pad(value, (0, padding))
-        print(f"Migrated checkpoint: added {padding} spatial features with zero initial weights; learned outputs preserved.")
+        if (saved_features is None or
+                saved_features.get("velocity_representation") != trainer.model.velocity_representation):
+            raise ValueError(
+                "Checkpoint uses incompatible velocity outputs. Direct-velocity weights cannot "
+                "be resumed as vector potentials; start a new run in a separate CHECKPOINT_DIR."
+            )
+        if tuple(saved_features.get("coordinate_lengths", ())) != trainer.model.coordinate_lengths:
+            raise ValueError("Checkpoint reference lengths differ from the configured model")
+        if tuple(saved_features["spatial_frequencies"]) != trainer.model.spatial_frequencies:
+            raise ValueError("Checkpoint spatial frequencies differ from config; restore the checkpoint's frequency setting before resuming.")
 
     def has_checkpoint(self, which="latest"):
         if which == "latest":

@@ -103,6 +103,20 @@ class Monitor:
                 "data": lc.latest_data_loss,
                 "pde_raw": lc.latest_pde_loss,
                 "weighted_pde": lc.latest_weighted_pde_loss,
+                "boundary_raw": lc.latest_boundary_loss,
+                "weighted_boundary": lc.latest_weighted_boundary_loss,
+                "vorticity_raw": lc.latest_vorticity_loss,
+                "weighted_vorticity": lc.latest_weighted_vorticity_loss,
+            }
+            status["objective"] = {
+                "weighted_terms": {
+                    "data": lc.latest_data_loss,
+                    "boundary": lc.latest_weighted_boundary_loss,
+                    "vorticity": lc.latest_weighted_vorticity_loss,
+                    "momentum": lc.latest_weighted_pde_loss,
+                    "mass": 0.0,
+                },
+                "gradients": lc.latest_objective_gradients,
             }
             status["field_losses"] = {"u": row[LogCol.U_LOSS], "v": row[LogCol.V_LOSS], "w": row[LogCol.W_LOSS], "p": row[LogCol.P_LOSS]}
             status["pde"] = {
@@ -166,6 +180,7 @@ class Monitor:
                 "freestream_error": val_row[ValLogCol.FREESTREAM_ERROR],
                 "overall_error": val_row[ValLogCol.OVERALL_ERROR],
             }
+            status["vorticity_validation"] = getattr(trainer, "latest_vorticity_validation", None)
         
         latest_stats = getattr(trainer, "latest_stats", None)
 

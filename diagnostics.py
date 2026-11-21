@@ -1,8 +1,5 @@
 import torch
-import matplotlib.pyplot as plt
 from pathlib import Path
-import numpy as np
-from math import lcm
 
 class LogCol:
     EPOCH = 0
@@ -29,6 +26,8 @@ class LogCol:
     DATA_GRAD_NORM = 21
     PDE_GRAD_NORM = 22
     TARGET_GRAD_RATIO = 23
+    WEIGHTED_BOUNDARY_LOSS = 24
+    WEIGHTED_VORTICITY_LOSS = 25
 
 class ValLogCol:
     EPOCH = 0
@@ -54,13 +53,11 @@ class Diagnoser:
         else:
             self.save_dir = None
 
-        self.trainingHistory = torch.zeros(config.EPOCHS, 24)
+        self.trainingHistory = torch.zeros(config.EPOCHS, 26)
         self._log_idx = 0
 
         last_epoch = config.EPOCHS - 1
-        num_val_points = (last_epoch // config.VALIDATION_EVERY + 1
-                          + last_epoch // config.LR_UPDATE_EVERY + 1
-                          - (last_epoch // lcm(config.VALIDATION_EVERY, config.LR_UPDATE_EVERY) + 1))
+        num_val_points = last_epoch // config.VALIDATION_EVERY + 1
         self.validationHistory = torch.zeros(num_val_points, 8)
         self._val_idx = 0
 
@@ -70,9 +67,6 @@ class Diagnoser:
         cov, mean, std = self.loss_controller.pde_stability(
             self.loss_controller.loss_history, self.loss_controller.window
         )
-        grad_norm = torch.norm(torch.stack(
-            [p.grad.norm() for p in self.model.parameters() if p.grad is not None]
-        ))
         slope = self.loss_controller.pde_trend(
             self.loss_controller.loss_history, self.loss_controller.window
         )
@@ -90,6 +84,8 @@ class Diagnoser:
                 self.loss_controller.data_grad_norm,
                 self.loss_controller.pde_grad_norm,
                 self.loss_controller.pde_grad_ratio,
+                self.loss_controller.latest_weighted_boundary_loss,
+                self.loss_controller.latest_weighted_vorticity_loss,
             ], dtype=torch.float32)
         ])
         self.trainingHistory[self._log_idx] = logRow

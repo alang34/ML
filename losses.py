@@ -13,6 +13,19 @@ def _grad(output, inputs):
         retain_graph=True,
     )[0]
 
+def streamwise_vorticity(model, inputs, *, create_graph):
+    """Return omega_x * L / Uref from the model's scaled curl velocity."""
+    with torch.enable_grad():
+        spatial_inputs = inputs.detach().requires_grad_(True)
+        prediction = model(spatial_inputs)
+        grad_v = torch.autograd.grad(
+            prediction[:, 1].sum(), spatial_inputs, create_graph=create_graph, retain_graph=True,
+        )[0]
+        grad_w = torch.autograd.grad(
+            prediction[:, 2].sum(), spatial_inputs, create_graph=create_graph,
+        )[0]
+    return model.crossflow_ratio * (grad_w[:, 1] - grad_v[:, 2])
+
 
 def navier_stokes_residual(model, inputs):
 
@@ -116,7 +129,9 @@ def pde_component_rms(residual):
     return rx_rms, ry_rms, rz_rms, rc_rms
 
 def pde_loss(residual):
-    return F.smooth_l1_loss(residual,torch.zeros_like(residual),beta=5.0)
+    # Continuity is enforced by the curl outputs; retain it only for diagnostics.
+    momentum = residual[:, :3]
+    return F.smooth_l1_loss(momentum,torch.zeros_like(momentum),beta=5.0)
 
 class LossController:
     def __init__(self, u_loss_fn, v_loss_fn, w_loss_fn, p_loss_fn, pde_loss_fn):
@@ -140,6 +155,9 @@ class LossController:
         self.pde_grad_norm = 0.0
         self.pde_ratio_cap = self.pde_cosine_gate = self.pde_desired_ratio = 0.0
         self.latest_data_loss = self.latest_pde_loss = self.latest_weighted_pde_loss = self.latest_total_loss = 0.0
+        self.latest_boundary_loss = self.latest_weighted_boundary_loss = 0.0
+        self.latest_vorticity_loss = self.latest_weighted_vorticity_loss = 0.0
+        self.latest_objective_gradients = None
     def set_target_scales(self, target_scales):
         if target_scales.shape != (4,):
             raise ValueError(
@@ -177,7 +195,8 @@ class LossController:
         self.loss_history = self.loss_history[-self.window:]
         
         return u_loss, v_loss, w_loss, p_loss, pde_loss
-    def update(self, pred, target, pde_residual, epoch, model):
+    def update(self, pred, target, pde_residual, epoch, model, boundary_loss=None, boundary_weight=0.0,
+               vorticity_loss=None, vorticity_weight=0.0, measure_gradients=False):
         u_loss, v_loss, w_loss, p_loss, pde_loss = self.recordLosses(pred, target, pde_residual)
         data_loss = u_loss + v_loss + w_loss + p_loss
         if epoch <=10:
@@ -197,7 +216,20 @@ class LossController:
             self.lambda_u = self.lambda_v = self.lambda_w = self.lambda_p = 1.0
             if epoch % params.PDE_GRADIENT_EVERY == 0:
                 self.updatePDElambda(data_loss, pde_loss, model, epoch)
-        total_loss = data_loss + self.lambda_pde*pde_loss
+        terms = {"data": data_loss}
+        if self.lambda_pde:
+            terms["momentum"] = self.lambda_pde * pde_loss
+        self.latest_boundary_loss = boundary_loss.detach().item() if boundary_loss is not None else 0.0
+        self.latest_weighted_boundary_loss = boundary_weight * self.latest_boundary_loss
+        if boundary_loss is not None and boundary_weight:
+            terms["boundary"] = boundary_weight * boundary_loss
+        self.latest_vorticity_loss = vorticity_loss.detach().item() if vorticity_loss is not None else 0.0
+        self.latest_weighted_vorticity_loss = vorticity_weight * self.latest_vorticity_loss
+        if vorticity_loss is not None and vorticity_weight:
+            terms["vorticity"] = vorticity_weight * vorticity_loss
+        total_loss = sum(terms.values())
+        if measure_gradients:
+            self.measure_objective_gradients(terms, model, epoch)
         
         self.latest_data_loss, self.latest_pde_loss = data_loss.detach().item(), pde_loss.detach().item()
         
@@ -210,6 +242,17 @@ class LossController:
         )
         
         return total_loss
+
+    def measure_objective_gradients(self, terms, model, epoch):
+        parameters = [p for p in model.parameters() if p.requires_grad]
+        norms = {}
+        for name, term in terms.items():
+            gradients = torch.autograd.grad(term, parameters, retain_graph=True, allow_unused=True)
+            squared_norm = sum((g.detach().square().sum() for g in gradients if g is not None),
+                               term.new_zeros(()))
+            norms[name] = squared_norm.sqrt()
+        values = dict(zip(norms, torch.stack(list(norms.values())).cpu().tolist()))
+        self.latest_objective_gradients = {"epoch": epoch, "norms": values}
 
     def updatePDElambda(self, data_loss, pde_loss, model, epoch):
         parameters = [p for p in model.parameters() if p.requires_grad]

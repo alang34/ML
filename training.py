@@ -1,10 +1,9 @@
 from enum import Enum, auto
 import torch
-from config import params
-from losses import LossController
+from torch.nn.functional import smooth_l1_loss
+from losses import streamwise_vorticity
 from validation import validation
-from dashboard.monitor import Monitor
-from dashboard.plotting import render_training_monitor, save_parity_plots
+from dashboard.plotting import render_training_monitor
 from dashboard.server import start_dashboard_server
 import webbrowser
 
@@ -14,31 +13,38 @@ class TrainingPhase(Enum):
 
 
 class Trainer:
-    def __init__(self, model, dashboard_monitor, optimizer, data, pde_residual, loss_controller, config, diagnostics, collocator, checkpoint_manager, scheduler, device):
+    def __init__(self, model, dashboard_monitor, optimizer, data, pde_residual, loss_controller, config, diagnostics, collocator, checkpoint_manager, scheduler, device, boundaries=None):
         self.model = model
         self.dashboard_monitor = dashboard_monitor
         self.optimizer = optimizer
         self.data = data
         self.pde_residual = pde_residual
         self.loss_controller = loss_controller
+        self.boundaries = boundaries
         self.config = config
         self.diagnostics = diagnostics
-        self.latest_metrics = None
         self.latest_stats = None
         self.latest_fields = None
         self.latest_pde_components = None
+        self.latest_vorticity_validation = None
         self.collocator = collocator
         self.checkpoint_manager = checkpoint_manager
         self.scheduler = scheduler
         self.plotNow = False
         self.saveNow = False
-        self.latest_colloc = None
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.initial_lr = float(config.LR)
+        if getattr(config, "VORTICITY_LOSS_WEIGHT", 0.0) > 0 and config.VORTICITY_POINTS_PER_CASE <= 0:
+            raise ValueError("Wake vorticity supervision requires VORTICITY_POINTS_PER_CASE > 0")
+        if config.LR_DECAY_HALF_LIFE <= 0 or not 0 < config.LR_MIN <= self.initial_lr:
+            raise ValueError("Learning rate decay requires a positive half-life and 0 < LR_MIN <= LR")
 
         self.model.to(self.device)
 
-        self.target_scales = (self.data.train_targets.std(dim=0).to(self.device).clamp_min(1e-6))
+        target_scales = getattr(self.data, "target_scales", None)
+        if target_scales is None:
+            target_scales = self.data.train_targets.std(dim=0).clamp_min(1e-6)
+        self.target_scales = target_scales.to(self.device)
         
         if self.target_scales.shape != (4,):
             raise ValueError(
@@ -58,9 +64,6 @@ class Trainer:
             raise FloatingPointError(f"Non-finite {name} at epoch {self.epoch} ({bad}/{value.numel()} values)")
 
     def train(self):
-        if self.epoch > 0 and self.diagnostics._val_idx > 0:
-            last_validation = self.diagnostics.validationHistory[self.diagnostics._val_idx - 1]
-            self.update_learning_rate(last_validation[1:5])
         self.dashboard_server = start_dashboard_server(self.dashboard_monitor.dashboard_dir,port=8000)
         webbrowser.open("http://localhost:8000/index.html")
         while self.epoch < self.config.EPOCHS:
@@ -70,23 +73,18 @@ class Trainer:
             self.plotNow = (self.epoch % self.config.PLOT_EVERY == 0)
             self.saveNow = (self.epoch % self.config.CHECKPOINT_SAVE_EVERY == 0)
 
-            update_lr = self.epoch > 0 and self.epoch % self.config.LR_UPDATE_EVERY == 0
-            if self.epoch % self.config.VALIDATION_EVERY == 0 or update_lr:
+            validation_due = self.epoch % self.config.VALIDATION_EVERY == 0
+            if validation_due:
                 self.validate()
-            if update_lr:
-                self.update_learning_rate([self.latest_metrics[name] for name in ("u", "v", "w", "p")])
-            if self.plotNow:
+            if self.plotNow and self.latest_fields is not None:
                 render_training_monitor(
                     self.diagnostics,
                     self.dashboard_monitor.dashboard_dir / "training_monitor.png",
-                    self._last_residual, 
-                    model = self.model, 
-                    x_colloc = self.latest_colloc, 
-                    device = self.device, 
-                    latest_fields = self.latest_fields, 
-                    latest_metrics = self.latest_metrics, 
-                    monitor = self.dashboard_monitor.dashboard_dir,
+                    self._last_residual,
+                    self.latest_fields,
                 )
+            else:
+                self.plotNow = False
             if self.epoch % self.config.PRINT_EVERY == 0:
                 self.dashboard_monitor.update(self, plot_updated=self.plotNow)
 
@@ -96,20 +94,28 @@ class Trainer:
 
             self.epoch += 1
 
-    def update_learning_rate(self, l2_errors):
-        errors = torch.as_tensor(l2_errors, dtype=torch.float64)
-        if errors.shape != (4,):
-            raise ValueError("Expected four validation L2 errors in [u, v, w, p] order")
-        self._require_finite(errors, "validation L2 errors for learning-rate update")
-        if (errors < 0).any():
-            raise ValueError("Validation L2 errors must be nonnegative")
-        average_l2 = errors.mean().item()
-        learning_rate = self.initial_lr * average_l2
-        for group in self.optimizer.param_groups:
-            group["lr"] = learning_rate
-        print(f"LR update at epoch {self.epoch}: average validation L2 = {100*average_l2:.2f}%, LR = {learning_rate:.6g}")
+    def warmup_boundaries(self):
+        if self.boundaries is None or self.config.BOUNDARY_WARMUP_STEPS == 0:
+            return
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.initial_lr)
+        evaluation_batch = self.boundaries.sample()
+        with torch.no_grad():
+            initial = self.boundaries.loss(self.model, evaluation_batch).item()
+        print(f"Boundary initialization: {self.config.BOUNDARY_WARMUP_STEPS} steps, initial loss {initial:.6g}", flush=True)
+        for _ in range(self.config.BOUNDARY_WARMUP_STEPS):
+            optimizer.zero_grad()
+            loss = self.boundaries.loss(self.model, self.boundaries.sample())
+            self._require_finite(loss, "boundary warm-up loss")
+            loss.backward()
+            optimizer.step()
+        optimizer.zero_grad()
+        with torch.no_grad():
+            final = self.boundaries.loss(self.model, evaluation_batch)
+            self._require_finite(final, "boundary warm-up evaluation")
+        print(f"Boundary initialization complete: loss {final.item():.6g}", flush=True)
 
     def trainStep(self):
+        self.update_learning_rate()
         self.optimizer.zero_grad()
         if (
             0 < self.epoch <= self.config.PRETRAIN_EPOCHS
@@ -130,33 +136,45 @@ class Trainer:
         )
         if check_pde:
             x_colloc = self.collocator.getRefresh(self.config.N_COLLOCATION, epoch=self.epoch).to(self.device)
-            self.latest_colloc = x_colloc.detach()
             x_colloc.requires_grad_(True)
             residual = self.pde_residual(self.model, x_colloc)
             self._require_finite(residual, "PDE residual")
             self._last_residual = residual.detach()
-        else:
+        if supervised:
             residual = self._last_residual
 
+        diagnostics_residual = residual.detach()
         self.latest_pde_components = {
-            "mom_x": residual[:, 0].square().mean(),
-            "mom_y": residual[:, 1].square().mean(),
-            "mom_z": residual[:, 2].square().mean(),
-            "continuity": residual[:, 3].square().mean(),
+            "mom_x": diagnostics_residual[:, 0].square().mean(),
+            "mom_y": diagnostics_residual[:, 1].square().mean(),
+            "mom_z": diagnostics_residual[:, 2].square().mean(),
+            "continuity": diagnostics_residual[:, 3].square().mean(),
 
-            "rx_rms": residual[:, 0].square().mean().sqrt(),
-            "ry_rms": residual[:, 1].square().mean().sqrt(),
-            "rz_rms": residual[:, 2].square().mean().sqrt(),
-            "rc_rms": residual[:, 3].square().mean().sqrt(),
+            "rx_rms": diagnostics_residual[:, 0].square().mean().sqrt(),
+            "ry_rms": diagnostics_residual[:, 1].square().mean().sqrt(),
+            "rz_rms": diagnostics_residual[:, 2].square().mean().sqrt(),
+            "rc_rms": diagnostics_residual[:, 3].square().mean().sqrt(),
 
-            "rx_max": residual[:, 0].abs().max(),
-            "ry_max": residual[:, 1].abs().max(),
-            "rz_max": residual[:, 2].abs().max(),
-            "rc_max": residual[:, 3].abs().max(),
+            "rx_max": diagnostics_residual[:, 0].abs().max(),
+            "ry_max": diagnostics_residual[:, 1].abs().max(),
+            "rz_max": diagnostics_residual[:, 2].abs().max(),
+            "rc_max": diagnostics_residual[:, 3].abs().max(),
         }
 
-        loss_residual = residual.detach() if supervised else residual
-        loss = self.loss_controller.update(pred, targets, loss_residual, epoch=self.epoch, model=self.model)
+        boundary_loss = None
+        if self.boundaries is not None and self.config.BOUNDARY_LOSS_WEIGHT > 0:
+            boundary_loss = self.boundaries.loss(self.model, self.boundaries.sample())
+        vorticity_weight = getattr(self.config, "VORTICITY_LOSS_WEIGHT", 0.0)
+        vorticity_loss = self.wake_vorticity_loss() if vorticity_weight > 0 else None
+        gradient_interval = getattr(self.config, "LOSS_GRADIENT_DIAGNOSTIC_EVERY", 0)
+        loss = self.loss_controller.update(
+            pred, targets, residual, epoch=self.epoch, model=self.model,
+            boundary_loss=boundary_loss, boundary_weight=getattr(self.config, "BOUNDARY_LOSS_WEIGHT", 0.0),
+            vorticity_loss=vorticity_loss, vorticity_weight=vorticity_weight,
+            measure_gradients=gradient_interval > 0 and (
+                self.loss_controller.latest_objective_gradients is None or self.epoch % gradient_interval == 0
+            ),
+        )
         self._require_finite(loss, "total loss")
         loss.backward()
         for name, parameter in self.model.named_parameters():
@@ -164,6 +182,28 @@ class Trainer:
                 self._require_finite(parameter.grad, f"gradient for {name}")
         self.optimizer.step()
         return self.loss_controller.report_LL()
+
+    def wake_vorticity_loss(self):
+        count = self.config.VORTICITY_POINTS_PER_CASE
+        generator = torch.Generator().manual_seed(self.config.SEED + self.epoch)
+        inputs, targets, scales = [], [], []
+        for points, labels, scale in self.data.vorticity_training:
+            idx = torch.randperm(len(points), generator=generator)[:count]
+            inputs.append(points[idx])
+            targets.append(labels[idx])
+            scales.append(scale.expand(len(idx)))
+        prediction = streamwise_vorticity(self.model, torch.cat(inputs).to(self.device), create_graph=True)
+        error = (prediction - torch.cat(targets).to(self.device)) / torch.cat(scales).to(self.device)
+        return smooth_l1_loss(error, torch.zeros_like(error))
+
+    def update_learning_rate(self):
+        # Use the absolute epoch so a restart continues the same decay schedule.
+        learning_rate = max(
+            self.config.LR_MIN,
+            self.initial_lr * 0.5 ** (self.epoch / self.config.LR_DECAY_HALF_LIFE),
+        )
+        for group in self.optimizer.param_groups:
+            group["lr"] = learning_rate
 
     def validate(self):
         self.model.eval()
@@ -175,14 +215,18 @@ class Trainer:
                 self.data.val_deficit.to(self.device),
                 epoch=self.epoch,
             )
+            wake = getattr(self.data, "vorticity_validation", ())
+            if wake:
+                points, targets = map(torch.cat, zip(*wake))
+                prediction = streamwise_vorticity(self.model, points.to(self.device), create_graph=False).cpu()
+                error = prediction - targets
+                self.latest_vorticity_validation = {
+                    "relative_l2": float(error.norm() / targets.norm().clamp_min(1e-12)),
+                    "rms": float(error.square().mean().sqrt()),
+                    "count": len(targets),
+                }
         self.model.train()
         self.diagnostics.log_validation(row, extras)
-        self.latest_metrics = {
-            "u": float(row[1]),
-            "v": float(row[2]),
-            "w": float(row[3]),
-            "p": float(row[4]),
-        }
         pred = extras["pred"]
         target = extras["target"]
         field_names = ["u", "v", "w", "p"]

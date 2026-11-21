@@ -7,7 +7,7 @@ from diagnostics import LogCol, ValLogCol
 from config import params
 
 
-def render_training_monitor(diagnoser, save_path, residual, model, x_colloc, device, latest_fields, latest_metrics, monitor):
+def render_training_monitor(diagnoser, save_path, residual, latest_fields):
     data = diagnoser._filled()
     if data.shape[0] == 0:
         return
@@ -26,11 +26,17 @@ def render_training_monitor(diagnoser, save_path, residual, model, x_colloc, dev
     ax = axes[0, 0]
     ax.plot(epochs, data[:, LogCol.U_LOSS] + data[:, LogCol.V_LOSS] + data[:, LogCol.W_LOSS] + data[:,LogCol.P_LOSS], label="data (raw)")
     weighted_pde = data[:, LogCol.LAMBDA_PDE] * data[:, LogCol.PDE_LOSS]
-    ax.plot(epochs, data[:, LogCol.TOTAL_LOSS] - weighted_pde, label="data (scaled objective)")
+    weighted_boundary = data[:, LogCol.WEIGHTED_BOUNDARY_LOSS]
+    weighted_vorticity = data[:, LogCol.WEIGHTED_VORTICITY_LOSS]
+    ax.plot(epochs, data[:, LogCol.TOTAL_LOSS] - weighted_pde - weighted_boundary - weighted_vorticity,
+            label="data (scaled objective)")
+    ax.plot(epochs, weighted_boundary, label="boundary (weighted)")
+    if weighted_vorticity.any():
+        ax.plot(epochs, weighted_vorticity, label="wake vorticity (weighted)")
     ax.plot(epochs, data[:, LogCol.PDE_LOSS], label="pde (raw)")
     ax.plot(epochs, weighted_pde, label="pde (weighted)")
     ax.plot(epochs, data[:, LogCol.TOTAL_LOSS], label="total (optimized)")
-    ax.set_yscale("log"); ax.set_title("Total/data/PDE losses"); ax.set_xlabel("epoch"); ax.legend()
+    ax.set_yscale("log"); ax.set_title("Training objectives"); ax.set_xlabel("epoch"); ax.legend()
 
     ax = axes[0, 1]
     ax.plot(epochs, data[:, LogCol.U_LOSS], label="u")
@@ -84,7 +90,8 @@ def render_training_monitor(diagnoser, save_path, residual, model, x_colloc, dev
     ax = axes[2, 0]
     latest_val_extras = diagnoser.latest_val_extras
     pairs = (latest_val_extras["error_deficit_pairs"].detach().cpu().numpy())
-    pairs = pairs[np.random.choice(pairs.shape[0], max_points, replace = False)]
+    if len(pairs) > max_points:
+        pairs = pairs[np.random.choice(len(pairs), max_points, replace=False)]
     ax.scatter(pairs[:, 0],pairs[:, 1],s=1,alpha=0.25,rasterized=True,)
     ax.set_yscale("log")
     ax.set_xlabel("Velocity deficit")
